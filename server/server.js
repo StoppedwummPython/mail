@@ -3,16 +3,15 @@ const keyManager = require('./key-manager');
 const mailChainManager = require('./mail-chain');
 const readline = require('readline');
 const fs = require('fs');
-const crypto = require('crypto'); // Import crypto for generating challenges
+const crypto = require('crypto');
 
 const app = express();
 const PORT = 3000;
 const DB_FILE = './server_data.json';
 const PUBLIC_DOMAINS = new Set(['public.com']);
 
-// In-memory store for pending challenges. In production, this would be a Redis cache or similar.
+// In-memory store for pending challenges.
 const pendingChallenges = new Map();
-
 
 // --- DATA PERSISTENCE ---
 function loadData() {
@@ -44,35 +43,50 @@ function saveData() {
 }
 
 // --- API ENDPOINTS ---
-app.use(express.json());
-app.use(express.static('public')); // Serve static files from 'public' directory
+// The express limit here is 10 Megabytes. This is now your actual limit!
+app.use(express.json({ limit: '10mb' }));
+app.use(express.static('public'));
 
 app.post('/register', (req, res) => {
   const { address } = req.body;
-  if (!address || !address.includes('@')) { return res.status(400).json({ error: 'A valid address format (user@domain or *@domain) is required.' }); }
+  if (!address || !address.includes('@')) { return res.status(400).json({ error: 'A valid address format is required.' }); }
   const isWildcard = address.startsWith('*@');
   const domain = address.split('@')[1];
-  if (!PUBLIC_DOMAINS.has(domain)) {
-    if (!isWildcard) { return res.status(403).json({ error: `Registration of individual addresses on the private domain '${domain}' is not allowed. Please register the entire domain using '*@${domain}'.` }); }
+  
+  if (!PUBLIC_DOMAINS.has(domain) && !isWildcard) { 
+      return res.status(403).json({ error: `Registration of individual addresses on the private domain '${domain}' is not allowed. Please register '*@${domain}'.` }); 
   }
-  if (PUBLIC_DOMAINS.has(domain)) {
-    if (isWildcard) { return res.status(403).json({ error: `Cannot register an entire public domain. Please register a specific address on '${domain}'.` }); }
+  if (PUBLIC_DOMAINS.has(domain) && isWildcard) { 
+      return res.status(403).json({ error: `Cannot register an entire public domain.` }); 
   }
+  
   const { privateKey, alreadyExists } = keyManager.registerIdentifier(address);
   if (alreadyExists) { return res.status(409).json({ error: `The address or domain '${address}' is already registered.` }); }
+  
   console.log(`\n[API] Registered new identifier: ${address}`);
   saveData();
   res.status(201).json({ message: `Successfully registered '${address}'.`, privateKey: privateKey });
 });
 
+// --- CHALLENGE-RESPONSE FLOW FOR SENDING MAIL ---
 
-// --- NEW CHALLENGE-RESPONSE FLOW FOR SENDING MAIL ---
-
-// STEP 1: Client initiates a send, server replies with a challenge
 app.post('/send-challenge', (req, res) => {
-    const { sender, recipient, encryptedContent } = req.body;
-    if (!sender || !recipient || !encryptedContent) {
-        return res.status(400).json({ error: 'Request must include sender, recipient, and encryptedContent.' });
+    // Extracting all possible formats (Hybrid, Dual-RSA, and Old Single-RSA)
+    const { 
+        sender, recipient, 
+        encryptedMessage, iv, tag, encryptedKeyForRecipient, encryptedKeyForSender, // NEW: Hybrid Encryption fields
+        encryptedContent, encryptedForRecipient, encryptedForSender // OLD: Backwards compatibility
+    } = req.body;
+    
+    if (!sender || !recipient) {
+        return res.status(400).json({ error: 'Request must include sender and recipient.' });
+    }
+
+    const hasNewFormat = encryptedMessage && iv && tag && encryptedKeyForRecipient && encryptedKeyForSender;
+    const hasOldFormat = encryptedContent || (encryptedForRecipient && encryptedForSender);
+
+    if (!hasNewFormat && !hasOldFormat) {
+        return res.status(400).json({ error: 'Request must include valid encrypted payload(s).' });
     }
 
     const senderPublicKey = keyManager.getPublicKey(sender);
@@ -81,31 +95,38 @@ app.post('/send-challenge', (req, res) => {
     }
 
     const challengeId = crypto.randomUUID();
-    const originalNonce = crypto.randomBytes(32).toString('hex'); // This is the secret answer
+    const originalNonce = crypto.randomBytes(32).toString('hex');
 
-    // Encrypt the secret answer with the sender's public key
     const encryptedNonce = crypto.publicEncrypt(
         { key: senderPublicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
         Buffer.from(originalNonce, 'utf-8')
     );
 
-    // Store the challenge details temporarily
-    pendingChallenges.set(challengeId, {
-        originalNonce,
-        mailData: { sender, recipient, encryptedContent, timestamp: new Date().toISOString() }
-    });
+    const mailData = { sender, recipient, timestamp: new Date().toISOString() };
     
-    // Set a timeout to clean up the challenge if it's not solved
-    setTimeout(() => pendingChallenges.delete(challengeId), 300000); // 5 minutes
+    // Store data based on which encryption method the client used
+    if (hasNewFormat) {
+        mailData.encryptedMessage = encryptedMessage;
+        mailData.iv = iv;
+        mailData.tag = tag;
+        mailData.encryptedKeyForRecipient = encryptedKeyForRecipient;
+        mailData.encryptedKeyForSender = encryptedKeyForSender;
+    } else if (encryptedForRecipient && encryptedForSender) {
+        mailData.encryptedForRecipient = encryptedForRecipient;
+        mailData.encryptedForSender = encryptedForSender;
+    } else {
+        mailData.encryptedContent = encryptedContent;
+    }
 
-    // Send the encrypted challenge back to the client
+    pendingChallenges.set(challengeId, { originalNonce, mailData });
+    setTimeout(() => pendingChallenges.delete(challengeId), 300000); // 5 mins
+
     res.status(200).json({
         challengeId,
         encryptedNonce: encryptedNonce.toString('base64'),
     });
 });
 
-// STEP 2: Client sends back the decrypted challenge, server verifies and finalizes
 app.post('/send-verify', (req, res) => {
     const { challengeId, decryptedNonce } = req.body;
     if (!challengeId || !decryptedNonce) {
@@ -117,24 +138,20 @@ app.post('/send-verify', (req, res) => {
         return res.status(404).json({ error: 'Invalid or expired challenge ID.' });
     }
     
-    // THE CORE VERIFICATION
     if (challenge.originalNonce === decryptedNonce) {
-        // SUCCESS! Proof of key possession is confirmed.
         const record = mailChainManager.addToChain(challenge.mailData);
         saveData();
-        pendingChallenges.delete(challengeId); // Clean up immediately
+        pendingChallenges.delete(challengeId);
         
         console.log(`\n[API] Challenge solved. Mail added from ${challenge.mailData.sender}`);
         return res.status(201).json({ message: 'Challenge successful. Mail sent.', record });
     } else {
-        // FAILURE!
         pendingChallenges.delete(challengeId);
         return res.status(403).json({ error: 'Challenge failed. Invalid response.' });
     }
 });
 
-
-// --- OTHER ENDPOINTS AND SERVER LOGIC ---
+// --- OTHER ENDPOINTS ---
 app.get('/publicKey/:address', (req, res) => {
   const { address } = req.params;
   const publicKey = keyManager.getPublicKey(address);
@@ -158,12 +175,11 @@ function initializeCli() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'SERVER> ' });
   rl.prompt();
   rl.on('line', (line) => {
-    // ... CLI logic remains the same ...
     const args = line.trim().split(' ');
     const command = args[0].toLowerCase();
     switch (command) {
       case 'help':
-        console.log(`Available Commands:\n  list, genkey <addr>, lookup <addr>, mailchain, clear, exit`);
+        console.log(`Available Commands:\n  list, exit`);
         break;
       case 'list':
         const ids = keyManager.listRegistered();
