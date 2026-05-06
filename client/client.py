@@ -93,22 +93,56 @@ class MailClient:
             return None
 
     def send_mail(self, recipient, message_content):
-        """Encrypts and sends an email to a recipient."""
+        """Encrypts and sends an email to a recipient using the new two-step challenge-response flow."""
+        if not self.private_key:
+            print("❌ Cannot send mail. You are not logged in.")
+            return
+        
         print(f"\n--- Sending Mail from {self.address} to {recipient} ---")
+        
+        # First, get the recipient's public key to encrypt the original message
         public_key = self._get_public_key(recipient)
-        if not public_key: return
-
+        if not public_key:
+            return
+        
+        # Encrypt the actual message content
         encrypted_content = base64.b64encode(public_key.encrypt(
             message_content.encode('utf-8'),
             padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
         )).decode('utf-8')
         
-        payload = {"sender": self.address, "recipient": recipient, "encryptedContent": encrypted_content}
-        response = requests.post(f"{self.server_url}/send", json=payload)
-        if response.status_code == 201:
-            print("✅ Mail successfully sent.")
+        # --- STEP 1: SEND CHALLENGE REQUEST ---
+        print("Initiating secure send... Requesting challenge from server.")
+        initial_payload = {"sender": self.address, "recipient": recipient, "encryptedContent": encrypted_content}
+        challenge_response = requests.post(f"{self.server_url}/send-challenge", json=initial_payload)
+        
+        if challenge_response.status_code != 200:
+            print(f"❌ Server rejected send request: {challenge_response.json().get('error')}")
+            return
+        
+        challenge_data = challenge_response.json()
+        challenge_id = challenge_data['challengeId']
+        encrypted_nonce_b64 = challenge_data['encryptedNonce']
+        
+        # --- STEP 2: SOLVE THE CHALLENGE ---
+        print("Challenge received. Decrypting with private key...")
+        encrypted_nonce_bytes = base64.b64decode(encrypted_nonce_b64)
+        
+        # This is the proof-of-possession step
+        decrypted_nonce = self.private_key.decrypt(
+            encrypted_nonce_bytes,
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        ).decode('utf-8')
+        
+        # --- STEP 3: SEND VERIFICATION ---
+        print("Challenge solved. Sending verification back to server...")
+        verification_payload = {"challengeId": challenge_id, "decryptedNonce": decrypted_nonce}
+        final_response = requests.post(f"{self.server_url}/send-verify", json=verification_payload)
+        
+        if final_response.status_code == 201:
+            print("✅ Mail sent successfully after passing security challenge.")
         else:
-            print(f"❌ Failed to send mail: {response.text}")
+            print(f"❌ Server rejected verification: {final_response.json().get('error')}")
 
     def check_inbox(self):
         """Fetches the mail-chain and decrypts messages for this client."""
