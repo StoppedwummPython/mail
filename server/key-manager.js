@@ -1,11 +1,10 @@
 const crypto = require('crypto');
 
-// In-memory storage for public keys, to be populated by server.js.
+// In-memory storage for public keys
 const publicKeyStore = new Map();
 
 /**
  * Generates a new RSA key pair.
- * @returns {{publicKey: string, privateKey: string}}
  */
 function generateKeyPair() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -18,46 +17,59 @@ function generateKeyPair() {
 
 /**
  * Registers a new identifier and stores its public key.
- * @param {string} identifier
- * @returns {{privateKey: string, alreadyExists: boolean}}
+ * Normalizes the identifier to lowercase to prevent lookup misses.
  */
 function registerIdentifier(identifier) {
-  if (publicKeyStore.has(identifier)) {
+  if (!identifier) return { privateKey: null, alreadyExists: false };
+  
+  const id = identifier.trim().toLowerCase();
+
+  if (publicKeyStore.has(id)) {
     return { privateKey: null, alreadyExists: true };
   }
+  
   const { publicKey, privateKey } = generateKeyPair();
-  publicKeyStore.set(identifier, publicKey);
+  publicKeyStore.set(id, publicKey);
   return { privateKey, alreadyExists: false };
 }
 
 /**
  * Retrieves the public key for a given address.
- * @param {string} address
- * @returns {string|null}
+ * 1. Checks for exact match (normalized).
+ * 2. Checks for wildcard domain match (e.g., *@domain.com).
  */
 function getPublicKey(address) {
-  if (publicKeyStore.has(address)) {
-    return publicKeyStore.get(address);
+  if (!address || !address.includes('@')) return null;
+
+  // Normalize input
+  const cleanAddress = address.trim().toLowerCase();
+  
+  // 1. Direct Lookup
+  if (publicKeyStore.has(cleanAddress)) {
+    return publicKeyStore.get(cleanAddress);
   }
-  const domain = `*@${address.split('@')[1]}`;
-  if (publicKeyStore.has(domain)) {
-    return publicKeyStore.get(domain);
+  
+  // 2. Wildcard Lookup (e.g. user@test.com -> *@test.com)
+  const domainPart = cleanAddress.split('@')[1];
+  const wildcardDomain = `*@${domainPart}`;
+  
+  if (publicKeyStore.has(wildcardDomain)) {
+    return publicKeyStore.get(wildcardDomain);
   }
+  
   return null;
 }
 
 /**
  * Returns a list of all registered identifiers.
- * @returns {string[]}
  */
 function listRegistered() {
   return Array.from(publicKeyStore.keys());
 }
 
-// Export the functions and the store itself so server.js can access it.
 module.exports = {
   registerIdentifier,
   getPublicKey,
   listRegistered,
-  publicKeyStore, // This export is the fix for the bug.
+  publicKeyStore,
 };
