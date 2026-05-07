@@ -19,15 +19,15 @@ function loadData() {
       const rawData = fs.readFileSync(DB_FILE);
       const loadedData = JSON.parse(rawData);
       
-      // Load Keys
+      // Clear and reload the Map in keyManager
+      keyManager.publicKeyStore.clear();
       for (const [identifier, key] of Object.entries(loadedData.publicKeys || {})) {
-        keyManager.publicKeyStore.set(identifier, key);
+        // Ensure we load them normalized
+        keyManager.publicKeyStore.set(identifier.toLowerCase(), key);
       }
       
-      // Load Mail (Rebuilds indices automatically)
       mailChainManager.loadChain(loadedData.mailChain);
-      
-      console.log(`[Persistence] Data loaded: ${mailChainManager.getChain().length} messages found.`);
+      console.log(`[Persistence] Loaded ${keyManager.publicKeyStore.size} keys and ${mailChainManager.getChain().length} messages.`);
     } else {
       console.log(`[Persistence] No data file found. Starting fresh.`);
     }
@@ -43,45 +43,69 @@ function saveData() {
       mailChain: mailChainManager.getChain(),
     };
     fs.writeFileSync(DB_FILE, JSON.stringify(serverData, null, 2));
+    console.log(`[Persistence] Data saved to ${DB_FILE}`);
   } catch (error) {
     console.error('[Persistence] Error saving data:', error);
   }
 }
 
-// --- API ENDPOINTS ---
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static('public'));
 
+// --- LOGGING MIDDLEWARE ---
+app.use((req, res, next) => {
+    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+    next();
+});
+
+// --- API ENDPOINTS ---
+
 app.post('/register', (req, res) => {
   const { address } = req.body;
-  if (!address || !address.includes('@')) return res.status(400).json({ error: 'Valid address required.' });
+  if (!address || !address.includes('@')) return res.status(400).json({ error: 'Invalid address format.' });
 
-  const domain = address.split('@')[1];
+  const domain = address.split('@')[1].toLowerCase();
   const isWildcard = address.startsWith('*@');
 
+  // Logic check for Public vs Private domains
   if (!PUBLIC_DOMAINS.has(domain) && !isWildcard) { 
-    return res.status(403).json({ error: `Private domain: register '*@${domain}' instead.` }); 
+    return res.status(403).json({ error: `Domain '${domain}' is private. Register '*@${domain}' instead.` }); 
   }
   
   const { privateKey, alreadyExists } = keyManager.registerIdentifier(address);
-  if (alreadyExists) return res.status(409).json({ error: 'Already registered.' });
   
+  if (alreadyExists) {
+      console.log(`[Auth] Register failed: ${address} already exists.`);
+      return res.status(409).json({ error: 'Already registered.' });
+  }
+  
+  console.log(`[Auth] SUCCESSFULLY REGISTERED: ${address}`);
   saveData();
   res.status(201).json({ message: `Registered ${address}`, privateKey });
 });
 
-// --- CHALLENGE-RESPONSE FLOW ---
-app.post('/send-challenge', (req, res) => {
-    const { 
-        sender, recipient, 
-        encryptedMessage, iv, tag, encryptedKeyForRecipient, encryptedKeyForSender,
-        encryptedContent, encryptedForRecipient, encryptedForSender 
-    } = req.body;
-    
-    if (!sender || !recipient) return res.status(400).json({ error: 'Sender/recipient required.' });
+app.get('/publicKey/:address', (req, res) => {
+  const address = req.params.address;
+  const publicKey = keyManager.getPublicKey(address);
+  
+  if (!publicKey) {
+      console.log(`[Lookup] 404 - Key not found for: ${address}`);
+      return res.status(404).json({ error: 'Public key not found.' });
+  }
+  
+  console.log(`[Lookup] 200 - Found key for: ${address}`);
+  res.status(200).json({ address, publicKey });
+});
 
+// --- CHALLENGE FLOW ---
+app.post('/send-challenge', (req, res) => {
+    const { sender, recipient } = req.body;
     const senderPublicKey = keyManager.getPublicKey(sender);
-    if (!senderPublicKey) return res.status(404).json({ error: 'Sender not registered.' });
+    
+    if (!senderPublicKey) {
+        console.log(`[Mail] Challenge denied: Sender ${sender} not registered.`);
+        return res.status(404).json({ error: 'Sender not registered.' });
+    }
 
     const challengeId = crypto.randomUUID();
     const originalNonce = crypto.randomBytes(32).toString('hex');
@@ -90,13 +114,7 @@ app.post('/send-challenge', (req, res) => {
         Buffer.from(originalNonce, 'utf-8')
     );
 
-    const mailData = { 
-        sender, recipient, timestamp: new Date().toISOString(),
-        encryptedMessage, iv, tag, encryptedKeyForRecipient, encryptedKeyForSender,
-        encryptedContent, encryptedForRecipient, encryptedForSender 
-    };
-
-    pendingChallenges.set(challengeId, { originalNonce, mailData });
+    pendingChallenges.set(challengeId, { originalNonce, mailData: req.body });
     setTimeout(() => pendingChallenges.delete(challengeId), 300000);
 
     res.status(200).json({ challengeId, encryptedNonce: encryptedNonce.toString('base64') });
@@ -107,55 +125,25 @@ app.post('/send-verify', (req, res) => {
     const challenge = pendingChallenges.get(challengeId);
 
     if (!challenge || challenge.originalNonce !== decryptedNonce) {
-        pendingChallenges.delete(challengeId);
         return res.status(403).json({ error: 'Challenge failed.' });
     }
     
-    const record = mailChainManager.addToChain(challenge.mailData);
+    mailChainManager.addToChain(challenge.mailData);
     saveData();
     pendingChallenges.delete(challengeId);
-    
-    res.status(201).json({ message: 'Mail sent.', record });
+    console.log(`[Mail] Message accepted from ${challenge.mailData.sender} to ${challenge.mailData.recipient}`);
+    res.status(201).json({ message: 'Sent.' });
 });
 
-// --- EFFICIENT DATA RETRIEVAL ---
-
-/**
- * GET /mailchain?address=user@example.com
- * If address is provided, returns only relevant mail (O(1) lookup).
- * If no address, returns the whole chain.
- */
 app.get('/mailchain', (req, res) => {
   const { address } = req.query;
   if (address) {
-    return res.status(200).json({ address, chain: mailChainManager.getInbox(address) });
+    return res.status(200).json({ chain: mailChainManager.getInbox(address) });
   }
   res.status(200).json({ chain: mailChainManager.getChain() });
 });
 
-app.get('/publicKey/:address', (req, res) => {
-  const publicKey = keyManager.getPublicKey(req.params.address);
-  if (!publicKey) return res.status(404).json({ error: 'Not found.' });
-  res.status(200).json({ address: req.params.address, publicKey });
-});
-
 app.listen(PORT, () => {
   loadData();
-  console.log(`\nServer running on http://localhost:${PORT}`);
-  initializeCli();
+  console.log(`\nMail Server running on http://localhost:${PORT}`);
 });
-
-function initializeCli() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'SERVER> ' });
-  rl.prompt();
-  rl.on('line', (line) => {
-    const args = line.trim().split(' ');
-    switch (args[0].toLowerCase()) {
-      case 'list':
-        console.log(keyManager.listRegistered());
-        break;
-      case 'exit': process.exit(0);
-    }
-    rl.prompt();
-  });
-}
