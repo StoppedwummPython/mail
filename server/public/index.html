@@ -9,7 +9,9 @@
         body { background-color: #f8f9fa; }
         .mail-item { cursor: pointer; border-left: 4px solid transparent; }
         .mail-item:hover { background-color: #e9ecef; }
-        .mail-item.active { background-color: #0d6efd; color: white; border-left: 4px solid #0546a3; }
+        /* Fix: Ensure active selection looks distinct */
+        .mail-item.active { background-color: #0d6efd !important; color: white !important; border-left: 4px solid #0546a3; }
+        .mail-item.active small, .mail-item.active strong { color: white !important; }
         .vh-100 { height: 100vh; }
         #app { display: flex; flex-direction: column; height: 100vh; }
         .scrollable { overflow-y: auto; max-height: calc(100vh - 56px); }
@@ -40,16 +42,17 @@
                         <button class="btn btn-primary btn-sm" @click="openComposeModal" :disabled="isDomainClient">Compose</button>
                     </div>
                     <div class="list-group list-group-flush">
-                        <a v-for="mail in mailList" :key="mail.timestamp + mail.from" 
+                        <!-- FIX: Use internalId for selection logic to prevent multi-select bug -->
+                        <a v-for="mail in mailList" :key="mail.internalId" 
                            @click="selectMail(mail)" 
                            class="list-group-item list-group-item-action mail-item" 
-                           :class="{ 'active': selectedMail && selectedMail.timestamp === mail.timestamp }">
+                           :class="{ 'active': selectedMail && selectedMail.internalId === mail.internalId }">
                             <div class="d-flex w-100 justify-content-between align-items-center mb-1">
                                 <span class="badge" :class="mail.type === 'sent' ? 'badge-sent' : 'badge-inbox'">
                                     {{ mail.type === 'sent' ? 'Sent' : 'Inbox' }}
                                 </span>
-                                <small :class="selectedMail && selectedMail.timestamp === mail.timestamp ? 'text-light' : 'text-muted'">
-                                    {{ new Date(mail.timestamp).toLocaleTimeString() }}
+                                <small>
+                                    {{ formatDate(mail.timestamp) }}
                                 </small>
                             </div>
                             <div class="text-truncate">
@@ -58,7 +61,6 @@
                         </a>
                         <div v-if="mailList.length === 0" class="p-5 text-muted text-center">
                             <p>No messages in your inbox.</p>
-                            <small>(Messages you send will appear here if the server indexes them)</small>
                         </div>
                     </div>
                 </div>
@@ -123,7 +125,7 @@
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Message Content</label>
-                            <textarea class="form-control" rows="8" v-model="composeForm.message" placeholder="This message will be encrypted with AES-256-GCM..."></textarea>
+                            <textarea class="form-control" rows="8" v-model="composeForm.message" placeholder="Message content..."></textarea>
                         </div>
                     </div>
                     <div class="modal-footer d-flex">
@@ -162,6 +164,13 @@
                 this.composeModalInstance = new bootstrap.Modal(document.getElementById('composeModal'));
             },
             methods: {
+                // --- HELPER ---
+                formatDate(ts) {
+                    if (!ts) return "No Date";
+                    const d = new Date(ts);
+                    return isNaN(d.getTime()) ? "No Date" : d.toLocaleTimeString();
+                },
+
                 // --- AUTHENTICATION ---
                 async handleLogin() {
                     this.isLoading = true; this.error = '';
@@ -218,9 +227,8 @@
                 // --- OPTIMIZED MAIL FETCHING ---
                 async fetchMail() {
                     try {
-                        // EFFICIENCY: Only fetch mail for THIS user, not the whole server chain
                         const url = this.isDomainClient 
-                            ? `${SERVER_URL}/mailchain` // Admins still see full chain
+                            ? `${SERVER_URL}/mailchain` 
                             : `${SERVER_URL}/mailchain?address=${encodeURIComponent(this.address)}`;
                         
                         const res = await fetch(url); 
@@ -228,7 +236,7 @@
                         const data = await res.json();
                         
                         // Process and decrypt the returned messages
-                        this.mailList = data.chain.map(mail => {
+                        this.mailList = data.chain.map((mail, index) => {
                             try {
                                 const isSentByMe = mail.sender === this.address;
                                 let decryptedContent = "";
@@ -255,16 +263,17 @@
                                 }
 
                                 return { 
+                                    internalId: mail.id || `msg-${index}-${mail.timestamp}`, // FIX: Unique key for Vue selection
                                     from: mail.sender, to: mail.recipient, 
                                     timestamp: mail.timestamp, content: decryptedContent,
                                     type: isSentByMe ? 'sent' : 'inbox' 
                                 };
-                            } catch (e) { return null; } // Skip messages we can't decrypt
+                            } catch (e) { return null; } 
                         }).filter(m => m !== null).reverse();
                     } catch (err) { console.error("Mail Fetch Error:", err); }
                 },
 
-                // --- HYBRID SENDING ---
+                // --- SENDING ---
                 async handleSendMail() {
                     if (!this.composeForm.message) return;
                     this.isLoading = true; this.status = 'Encrypting...';
@@ -292,12 +301,11 @@
                             encryptedKeyForSender: forge.util.encode64(myPubKey.encrypt(aesKey, 'RSA-OAEP', { md: forge.md.sha256.create() }))
                         };
 
-                        this.status = 'Solving Proof-of-Identity...';
+                        this.status = 'Solving Challenge...';
                         const challengeRes = await fetch(`${SERVER_URL}/send-challenge`, { 
                             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) 
                         });
                         const challengeData = await challengeRes.json();
-                        
                         const decryptedNonce = this.privateKey.decrypt(forge.util.decode64(challengeData.encryptedNonce), 'RSA-OAEP', { md: forge.md.sha256.create() });
                         
                         await fetch(`${SERVER_URL}/send-verify`, { 
