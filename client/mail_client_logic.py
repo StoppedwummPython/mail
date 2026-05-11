@@ -6,12 +6,9 @@ import re
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 class MailClientLogic:
-    """
-    Handles all non-GUI logic. This version implements the new
-    two-step challenge-response protocol for sending mail.
-    """
     def __init__(self, server_url, address, log_callback):
         self.server_url = server_url
         self.address = address
@@ -20,159 +17,154 @@ class MailClientLogic:
         self.config_file = self._get_config_filename(address)
 
     def send_mail(self, recipient, message_content):
-        """Sends an email using the new two-step challenge-response flow."""
+        """Sends mail using Hybrid Encryption so both sender and recipient can read it."""
         if not self.private_key:
-            return False, "Cannot send mail. You are not logged in."
+            return False, "Not logged in."
 
         try:
-            # First, get the recipient's public key to encrypt the original message
-            self.log(f"Preparing message for '{recipient}'...")
-            recipient_key_response = requests.get(f"{self.server_url}/publicKey/{recipient}")
-            if recipient_key_response.status_code != 200:
-                return False, f"Could not get public key: {recipient_key_response.json().get('error')}"
-            
-            recipient_public_key = serialization.load_pem_public_key(recipient_key_response.json()['publicKey'].encode('utf-8'))
-            
-            # Encrypt the actual message content
-            encrypted_content = base64.b64encode(recipient_public_key.encrypt(
-                message_content.encode('utf-8'),
-                padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-            )).decode('utf-8')
+            # 1. Get Recipient Public Key
+            res = requests.get(f"{self.server_url}/publicKey/{recipient}")
+            if res.status_code != 200:
+                return False, "Recipient not found."
+            recipient_pub_pem = res.json()['publicKey']
+            recipient_public_key = serialization.load_pem_public_key(recipient_pub_pem.encode())
 
-            # --- STEP 1: SEND CHALLENGE REQUEST ---
-            self.log("Initiating secure send... Requesting challenge from server.")
-            initial_payload = {"sender": self.address, "recipient": recipient, "encryptedContent": encrypted_content}
-            challenge_response = requests.post(f"{self.server_url}/send-challenge", json=initial_payload)
-
-            if challenge_response.status_code != 200:
-                return False, f"Server rejected send request: {challenge_response.json().get('error')}"
-
-            challenge_data = challenge_response.json()
-            challenge_id = challenge_data['challengeId']
-            encrypted_nonce_b64 = challenge_data['encryptedNonce']
+            # 2. Hybrid Encryption (AES-GCM)
+            # Generate a random 32-byte key and 12-byte IV
+            aes_key = AESGCM.generate_key(bit_length=256)
+            aesgcm = AESGCM(aes_key)
+            iv = os.urandom(12)
             
-            # --- STEP 2: SOLVE THE CHALLENGE ---
-            self.log("Challenge received. Decrypting with private key...")
-            encrypted_nonce_bytes = base64.b64decode(encrypted_nonce_b64)
-            
-            # This is the proof-of-possession step
+            # Encrypt the message body
+            ciphertext_with_tag = aesgcm.encrypt(iv, message_content.encode(), None)
+            # AESGCM in cryptography.py puts the tag at the end of the ciphertext
+            tag = ciphertext_with_tag[-16:]
+            encrypted_msg = ciphertext_with_tag[:-16]
+
+            # 3. RSA Encrypt the AES key for BOTH recipient and sender
+            def rsa_encrypt(key, data):
+                return key.encrypt(
+                    data,
+                    padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                )
+
+            enc_key_recipient = rsa_encrypt(recipient_public_key, aes_key)
+            enc_key_sender = rsa_encrypt(self.private_key.public_key(), aes_key)
+
+            # 4. Prepare Payload for Step 1 (Challenge)
+            payload = {
+                "sender": self.address,
+                "recipient": recipient,
+                "encryptedMessage": base64.b64encode(encrypted_msg).decode(),
+                "iv": base64.b64encode(iv).decode(),
+                "tag": base64.b64encode(tag).decode(),
+                "encryptedKeyForRecipient": base64.b64encode(enc_key_recipient).decode(),
+                "encryptedKeyForSender": base64.b64encode(enc_key_sender).decode()
+            }
+
+            # 5. Challenge-Response
+            self.log("Sending challenge request...")
+            chal_res = requests.post(f"{self.server_url}/send-challenge", json=payload)
+            if chal_res.status_code != 200:
+                return False, chal_res.json().get('error')
+
+            data = chal_res.json()
+            # Decrypt nonce to prove identity
             decrypted_nonce = self.private_key.decrypt(
-                encrypted_nonce_bytes,
+                base64.b64decode(data['encryptedNonce']),
                 padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-            ).decode('utf-8')
+            ).decode()
 
-            # --- STEP 3: SEND VERIFICATION ---
-            self.log("Challenge solved. Sending verification back to server...")
-            verification_payload = {"challengeId": challenge_id, "decryptedNonce": decrypted_nonce}
-            final_response = requests.post(f"{self.server_url}/send-verify", json=verification_payload)
+            # 6. Verify and Finalize
+            verify_res = requests.post(f"{self.server_url}/send-verify", json={
+                "challengeId": data['challengeId'],
+                "decryptedNonce": decrypted_nonce
+            })
 
-            if final_response.status_code == 201:
-                return True, "Mail sent successfully after passing security challenge."
-            else:
-                return False, f"Server rejected verification: {final_response.json().get('error')}"
+            return (True, "Success") if verify_res.status_code == 201 else (False, "Verification failed")
 
         except Exception as e:
-            self.log(f"An unexpected error occurred during send: {e}")
-            return False, f"An unexpected error occurred: {e}"
-
-    def _get_config_filename(self, address):
-        """Creates a safe filename from the client's address."""
-        sanitized_address = re.sub(r'[^a-zA-Z0-9_@.-]', '_', address)
-        return f"client_config_{sanitized_address}.json"
-
-    def _save_config(self):
-        """Saves the current private key to the config file matching the user's address."""
-        if not self.private_key: return
-        private_key_pem = self.private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        ).decode('utf-8')
-        with open(self.config_file, 'w') as f:
-            json.dump({"address": self.address, "private_key_pem": private_key_pem}, f, indent=4)
-
-    def _load_from_file(self, file_path):
-        """Generic function to load a private key from a given file path."""
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r') as f:
-                    config_data = json.load(f)
-                    self.private_key = serialization.load_pem_private_key(
-                        config_data['private_key_pem'].encode('utf-8'), password=None
-                    )
-                    return True
-            except Exception as e:
-                self.log(f"Error reading config file '{file_path}': {e}")
-                return False
-        return False
-
-    def _register(self):
-        """Registers the current address on the server."""
-        try:
-            response = requests.post(f"{self.server_url}/register", json={"address": self.address})
-            if response.status_code == 201:
-                data = response.json()
-                self.private_key = serialization.load_pem_private_key(
-                    data['privateKey'].encode('utf-8'), password=None
-                )
-                self._save_config()
-                return True, f"Successfully registered and saved new key for '{self.address}'."
-            else:
-                return False, f"Registration failed: {response.json().get('error')}"
-        except requests.exceptions.ConnectionError:
-            return False, f"Connection Error: Could not connect to {self.server_url}."
-
-    def load_or_register(self):
-        """Intelligent login: checks for specific key, then domain key, then registers."""
-        if self._load_from_file(self.config_file):
-            return True, f"Key for {self.address} loaded from local file."
-        
-        if not self.address.startswith('*@'):
-            try:
-                domain = self.address.split('@')[1]
-                wildcard_address = f"*@{domain}"
-                wildcard_config_file = self._get_config_filename(wildcard_address)
-                if self._load_from_file(wildcard_config_file):
-                    return True, f"Logged in as '{self.address}' using the domain key for '*{domain}'."
-            except IndexError:
-                pass # Malformed address, will fail at registration
-        
-        return self._register()
+            return False, str(e)
 
     def check_inbox(self):
-        """Fetches the mail-chain and decrypts messages."""
-        if not self.private_key:
-            return None, "Cannot check mail. Not logged in."
+        """Fetches and decrypts messages for both recipient and sender."""
+        if not self.private_key: return None, "Not logged in."
         try:
-            response = requests.get(f"{self.server_url}/mailchain")
-            if response.status_code != 200:
-                return None, "Error fetching mail-chain."
+            res = requests.get(f"{self.server_url}/mailchain")
+            if res.status_code != 200: return None, "Chain fetch failed."
 
-            decrypted_messages = []
-            is_domain_client = self.address.startswith('*@')
-            my_domain = self.address.split('@')[1] if is_domain_client else self.address.split('@')[1]
+            messages = []
+            is_domain = self.address.startswith('*@')
+            domain = self.address.split('@')[1] if '@' in self.address else ""
 
-            for mail in response.json()['chain']:
-                # A user can read mail sent to their specific address OR their domain
-                recipient_is_me = mail['recipient'] == self.address
-                recipient_in_my_domain = mail['recipient'].endswith(f"@{my_domain}")
+            for mail in res.json()['chain']:
+                is_recipient = mail['recipient'] == self.address or (is_domain and mail['recipient'].endswith(f"@{domain}"))
+                is_sender = mail['sender'] == self.address
+                
+                if not (is_recipient or is_sender):
+                    continue
 
-                if recipient_is_me or (is_domain_client and recipient_in_my_domain):
-                    try:
-                        decrypted_content = self.private_key.decrypt(
+                content = None
+                try:
+                    # Case 1: Hybrid Format (Try this first)
+                    if 'encryptedMessage' in mail:
+                        key_b64 = mail['encryptedKeyForRecipient'] if is_recipient else mail['encryptedKeyForSender']
+                        
+                        # Decrypt AES key
+                        aes_key = self.private_key.decrypt(
+                            base64.b64decode(key_b64),
+                            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                        )
+                        
+                        # Decrypt Body
+                        iv = base64.b64decode(mail['iv'])
+                        tag = base64.b64decode(mail['tag'])
+                        ciphertext = base64.b64decode(mail['encryptedMessage'])
+                        
+                        aesgcm = AESGCM(aes_key)
+                        content = aesgcm.decrypt(iv, ciphertext + tag, None).decode()
+
+                    # Case 2: Old Format (Only recipient can read these)
+                    elif 'encryptedContent' in mail and is_recipient:
+                        content = self.private_key.decrypt(
                             base64.b64decode(mail['encryptedContent']),
                             padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-                        ).decode('utf-8')
-                        
-                        decrypted_messages.append({
-                            'from': mail['sender'],
-                            'to': mail['recipient'],
-                            'timestamp': mail['timestamp'],
-                            'content': decrypted_content
+                        ).decode()
+
+                    if content:
+                        messages.append({
+                            'from': mail['sender'], 'to': mail['recipient'],
+                            'timestamp': mail['timestamp'], 'content': content
                         })
-                    except Exception:
-                        pass # Ignore messages that can't be decrypted
-            
-            return decrypted_messages, f"Found {len(decrypted_messages)} message(s)."
+                except:
+                    continue
+            return messages, "Done"
         except Exception as e:
-            return None, f"An error occurred while checking mail: {e}"
+            return None, str(e)
+
+    # --- Utility Methods ---
+    def _get_config_filename(self, addr):
+        return f"client_config_{re.sub(r'[^a-zA-Z0-9_@.-]', '_', addr)}.json"
+
+    def _save_config(self):
+        pem = self.private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        with open(self.config_file, 'w') as f: json.dump({"address": self.address, "private_key_pem": pem}, f)
+
+    def _load_from_file(self, path):
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                self.private_key = serialization.load_pem_private_key(data['private_key_pem'].encode(), password=None)
+                return True
+        return False
+
+    def load_or_register(self):
+        if self._load_from_file(self.config_file): return True, "Loaded"
+        try:
+            res = requests.post(f"{self.server_url}/register", json={"address": self.address})
+            if res.status_code == 201:
+                self.private_key = serialization.load_pem_private_key(res.json()['privateKey'].encode(), password=None)
+                self._save_config()
+                return True, "Registered"
+            return False, res.json().get('error')
+        except: return False, "Server Down"

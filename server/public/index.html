@@ -4,32 +4,34 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Secure Webmail Client</title>
-    <!-- Bootstrap for styling -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; }
-        .mail-item { cursor: pointer; }
+        .mail-item { cursor: pointer; border-left: 4px solid transparent; }
         .mail-item:hover { background-color: #e9ecef; }
-        .mail-item.active { background-color: #0d6efd; color: white; }
+        /* Fix: Ensure active selection looks distinct */
+        .mail-item.active { background-color: #0d6efd !important; color: white !important; border-left: 4px solid #0546a3; }
+        .mail-item.active small, .mail-item.active strong { color: white !important; }
         .vh-100 { height: 100vh; }
         #app { display: flex; flex-direction: column; height: 100vh; }
-        .scrollable { overflow-y: auto; max-height: calc(100vh - 100px); /* Adjusted for nav bar */ }
-        .mail-content { white-space: pre-wrap; word-wrap: break-word; font-family: monospace; }
-        .modal-body { max-height: 70vh; overflow-y: auto; }
+        .scrollable { overflow-y: auto; max-height: calc(100vh - 56px); }
+        .mail-content { white-space: pre-wrap; word-wrap: break-word; font-family: 'Courier New', Courier, monospace; background: #f1f1f1; padding: 15px; border-radius: 5px; }
+        .badge-inbox { background-color: #198754; } 
+        .badge-sent { background-color: #6c757d; } 
     </style>
 </head>
 <body>
 
     <div id="app" class="container-fluid p-0">
-        <!-- Main Application View (shown after login) -->
+        <!-- Main Application View -->
         <main v-if="isLoggedIn" class="d-flex flex-column flex-grow-1">
             <nav class="navbar navbar-expand-lg navbar-dark bg-dark p-2 shadow-sm">
-                <a class="navbar-brand" href="#">Secure Mail</a>
+                <a class="navbar-brand ms-2" href="#">Secure Mail</a>
                 <span class="navbar-text ms-auto me-3">
                     Logged in as: <strong>{{ address }}</strong>
                 </span>
-                <button class="btn btn-outline-secondary me-2" @click="downloadKeyFile">Download Key</button>
-                <button class="btn btn-outline-light" @click="logout">Logout</button>
+                <button class="btn btn-outline-secondary btn-sm me-2" @click="downloadKeyFile">Download Key</button>
+                <button class="btn btn-outline-light btn-sm" @click="logout">Logout</button>
             </nav>
 
             <div class="row g-0 flex-grow-1">
@@ -40,107 +42,116 @@
                         <button class="btn btn-primary btn-sm" @click="openComposeModal" :disabled="isDomainClient">Compose</button>
                     </div>
                     <div class="list-group list-group-flush">
-                        <a v-for="mail in mailList" :key="mail.timestamp" 
+                        <!-- FIX: Use internalId for selection logic to prevent multi-select bug -->
+                        <a v-for="mail in mailList" :key="mail.internalId" 
                            @click="selectMail(mail)" 
                            class="list-group-item list-group-item-action mail-item" 
-                           :class="{ 'active': selectedMail && selectedMail.timestamp === mail.timestamp }">
-                            <div>
-                                <small class="text-muted">{{ mail.from === address ? 'To: ' + mail.to : 'From: ' + mail.from }}</small>
-                                <strong class="d-block text-truncate">{{ mail.from === address ? mail.to : mail.from }}</strong>
+                           :class="{ 'active': selectedMail && selectedMail.internalId === mail.internalId }">
+                            <div class="d-flex w-100 justify-content-between align-items-center mb-1">
+                                <span class="badge" :class="mail.type === 'sent' ? 'badge-sent' : 'badge-inbox'">
+                                    {{ mail.type === 'sent' ? 'Sent' : 'Inbox' }}
+                                </span>
+                                <small>
+                                    {{ formatDate(mail.timestamp) }}
+                                </small>
                             </div>
-                            <small class="text-muted">{{ new Date(mail.timestamp).toLocaleString() }}</small>
+                            <div class="text-truncate">
+                                <strong>{{ mail.type === 'sent' ? 'To: ' + mail.to : 'From: ' + mail.from }}</strong>
+                            </div>
                         </a>
-                        <div v-if="mailList.length === 0" class="p-3 text-muted">No messages in inbox.</div>
+                        <div v-if="mailList.length === 0" class="p-5 text-muted text-center">
+                            <p>No messages in your inbox.</p>
+                        </div>
                     </div>
                 </div>
 
                 <!-- Mail Viewer Pane -->
                 <div class="col-md-8 d-flex flex-column">
-                    <div v-if="selectedMail" class="p-4 flex-grow-1 overflow-auto">
+                    <div v-if="selectedMail" class="p-4 flex-grow-1 overflow-auto bg-white">
                         <div class="border-bottom pb-2 mb-3">
-                            <p><strong>From:</strong> {{ selectedMail.from }}</p>
-                            <p><strong>To:</strong> {{ selectedMail.to }}</p>
-                            <p class="text-muted"><strong>Date:</strong> {{ new Date(selectedMail.timestamp).toLocaleString() }}</p>
+                            <div class="d-flex justify-content-between">
+                                <h4>{{ selectedMail.type === 'sent' ? 'Sent Message' : 'Received Message' }}</h4>
+                                <span class="text-muted small">{{ new Date(selectedMail.timestamp).toLocaleString() }}</span>
+                            </div>
+                            <p class="mb-1"><strong>From:</strong> {{ selectedMail.from }}</p>
+                            <p class="mb-1"><strong>To:</strong> {{ selectedMail.to }}</p>
                         </div>
                         <pre class="mail-content">{{ selectedMail.content }}</pre>
                     </div>
-                    <div v-else class="d-flex align-items-center justify-content-center flex-grow-1 text-center text-muted">
-                        <h5>Select a message to read it.</h5>
+                    <div v-else class="d-flex align-items-center justify-content-center flex-grow-1 text-center text-muted bg-white">
+                        <div>
+                            <img src="https://cdn-icons-png.flaticon.com/512/6584/6584938.png" style="width: 80px; opacity: 0.2;" class="mb-3">
+                            <h5>Select a message to decrypt and read</h5>
+                        </div>
                     </div>
                 </div>
             </div>
         </main>
 
         <!-- Login View -->
-        <div v-else class="d-flex align-items-center justify-content-center vh-100">
-            <div class="card p-4 shadow-sm" style="width: 400px;">
+        <div v-else class="d-flex align-items-center justify-content-center vh-100 bg-secondary">
+            <div class="card p-4 shadow-lg" style="width: 400px;">
                 <h3 class="text-center mb-4">Secure Mail Login</h3>
                 <form @submit.prevent="handleLogin">
                     <div class="mb-3">
-                        <label for="address" class="form-label">Your Address</label>
-                        <input type="text" class="form-control" id="address" v-model="loginForm.address" required>
-                        <div class="form-text">e.g., `alice@public.com` or `*@my-company.com`</div>
+                        <label class="form-label">Email Address</label>
+                        <input type="text" class="form-control" v-model="loginForm.address" placeholder="you@public.com" required>
                     </div>
                     <button type="submit" class="btn btn-primary w-100" :disabled="isLoading">
-                        <span v-if="isLoading && loginMethod === 'form'" class="spinner-border spinner-border-sm"></span>
-                        {{ isLoading && loginMethod === 'form' ? 'Logging in...' : 'Login / Register' }}
+                        {{ isLoading ? 'Processing...' : 'Login / Register' }}
                     </button>
-                    <div v-if="error" class="alert alert-danger mt-3 py-2">{{ error }}</div>
                 </form>
-
-                <hr>
-                <button class="btn btn-secondary w-100" @click="triggerFileInput" :disabled="isLoading">
-                    <span v-if="isLoading && loginMethod === 'file'" class="spinner-border spinner-border-sm"></span>
-                    {{ isLoading && loginMethod === 'file' ? 'Processing...' : 'Login with Key File' }}
+                <div class="text-center my-3 text-muted">OR</div>
+                <button class="btn btn-outline-dark w-100" @click="triggerFileInput" :disabled="isLoading">
+                    Login with .json Key File
                 </button>
                 <input type="file" ref="fileInput" @change="handleFileLogin" style="display: none;" accept=".json">
+                <div v-if="error" class="alert alert-danger mt-3 py-2 small">{{ error }}</div>
             </div>
         </div>
 
         <!-- Compose Mail Modal -->
         <div class="modal fade" id="composeModal" tabindex="-1">
             <div class="modal-dialog modal-lg">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title">Compose New Mail</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <div class="modal-content shadow-lg">
+                    <div class="modal-header bg-primary text-white">
+                        <h5 class="modal-title">New Secure Message</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <form @submit.prevent="handleSendMail">
-                            <div class="mb-3">
-                                <label for="recipient" class="form-label">Recipient</label>
-                                <input type="text" class="form-control" id="recipient" v-model="composeForm.recipient" required>
-                            </div>
-                            <div class="mb-3">
-                                <label for="message" class="form-label">Message</label>
-                                <textarea class="form-control" id="message" rows="10" v-model="composeForm.message" required></textarea>
-                            </div>
-                            <div class="modal-footer">
-                                <span v-if="status" class="text-success me-auto">{{ status }}</span>
-                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                                <button type="submit" class="btn btn-primary" :disabled="isLoading">
-                                    <span v-if="isLoading" class="spinner-border spinner-border-sm"></span> Send
-                                </button>
-                            </div>
-                        </form>
+                        <div class="mb-3">
+                            <label class="form-label">Recipient Address</label>
+                            <input type="text" class="form-control" v-model="composeForm.recipient" placeholder="user@public.com" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Message Content</label>
+                            <textarea class="form-control" rows="8" v-model="composeForm.message" placeholder="Message content..."></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer d-flex">
+                        <div v-if="status" class="small text-primary fw-bold">{{ status }}</div>
+                        <div class="ms-auto">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button @click="handleSendMail" class="btn btn-primary" :disabled="isLoading">
+                                <span v-if="isLoading" class="spinner-border spinner-border-sm"></span> Send Securely
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- External Libraries -->
     <script src="https://cdn.jsdelivr.net/npm/vue@2"></script>
     <script src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
-    <!-- Main Application Script -->
     <script>
-        const SERVER_URL = "http://localhost:3000";
+        const SERVER_URL = window.location.origin;
         const app = new Vue({
             el: '#app',
             data: {
-                isLoggedIn: false, isLoading: false, loginMethod: '', address: '', privateKey: null,
+                isLoggedIn: false, isLoading: false, address: '', privateKey: null,
                 mailList: [], selectedMail: null, error: '', status: '',
                 loginForm: { address: 'alice@public.com' },
                 composeForm: { recipient: 'bob@public.com', message: '' },
@@ -153,128 +164,170 @@
                 this.composeModalInstance = new bootstrap.Modal(document.getElementById('composeModal'));
             },
             methods: {
+                // --- HELPER ---
+                formatDate(ts) {
+                    if (!ts) return "No Date";
+                    const d = new Date(ts);
+                    return isNaN(d.getTime()) ? "No Date" : d.toLocaleTimeString();
+                },
+
+                // --- AUTHENTICATION ---
                 async handleLogin() {
-                    this.isLoading = true; this.loginMethod = 'form'; this.error = '';
+                    this.isLoading = true; this.error = '';
                     const userAddress = this.loginForm.address.trim();
                     try {
-                        let keyPem = this._loadKeyFromStorage(userAddress); let message = `Key for ${userAddress} loaded from local storage.`;
+                        let keyPem = localStorage.getItem(`securemail_privkey_${userAddress}`);
                         if (!keyPem && !userAddress.startsWith('*@')) {
-                            const domain = userAddress.split('@')[1]; const wildcardAddress = `*@${domain}`;
-                            keyPem = this._loadKeyFromStorage(wildcardAddress);
-                            if (keyPem) message = `Logged in as '${userAddress}' using domain key for '${wildcardAddress}'.`;
+                            const domain = userAddress.split('@')[1];
+                            keyPem = localStorage.getItem(`securemail_privkey_*@${domain}`);
                         }
-                        if (keyPem) { this.privateKey = forge.pki.privateKeyFromPem(keyPem); }
-                        else {
-                            const newKeyData = await this._registerOnServer(userAddress);
-                            this.privateKey = forge.pki.privateKeyFromPem(newKeyData.privateKey);
-                            this._saveKeyToStorage(userAddress, newKeyData.privateKey);
-                            message = `Successfully registered '${userAddress}' and saved new key.`;
+
+                        if (keyPem) {
+                            this.privateKey = forge.pki.privateKeyFromPem(keyPem);
+                        } else {
+                            const res = await fetch(`${SERVER_URL}/register`, { 
+                                method: 'POST', 
+                                headers: { 'Content-Type': 'application/json' }, 
+                                body: JSON.stringify({ address: userAddress }) 
+                            });
+                            if (!res.ok) throw new Error((await res.json()).error);
+                            const data = await res.json();
+                            this.privateKey = forge.pki.privateKeyFromPem(data.privateKey);
+                            localStorage.setItem(`securemail_privkey_${userAddress}`, data.privateKey);
                         }
-                        this._finalizeLogin(userAddress, message);
+                        this._finalizeLogin(userAddress);
                     } catch (err) { this.error = err.message; } finally { this.isLoading = false; }
                 },
-                triggerFileInput() { this.$refs.fileInput.click(); },
+
                 handleFileLogin(event) {
                     const file = event.target.files[0]; if (!file) return;
-                    this.isLoading = true; this.loginMethod = 'file'; this.error = '';
                     const reader = new FileReader();
                     reader.onload = (e) => {
                         try {
                             const data = JSON.parse(e.target.result);
-                            if (!data.address || !data.private_key_pem) throw new Error("Invalid key file. Must contain 'address' and 'private_key_pem'.");
                             this.privateKey = forge.pki.privateKeyFromPem(data.private_key_pem);
-                            this._saveKeyToStorage(data.address, data.private_key_pem);
-                            this._finalizeLogin(data.address, `Logged in with key file for '${data.address}'.`);
-                        } catch (err) { this.error = `Failed to process key file: ${err.message}`; }
-                        finally { this.isLoading = false; }
+                            localStorage.setItem(`securemail_privkey_${data.address}`, data.private_key_pem);
+                            this._finalizeLogin(data.address);
+                        } catch (err) { this.error = "Invalid Key File"; }
                     };
-                    reader.onerror = () => { this.error = "Failed to read file."; this.isLoading = false; };
                     reader.readAsText(file);
-                    event.target.value = '';
                 },
-                _finalizeLogin(address, message) {
-                    console.log(message); this.address = address; this.isLoggedIn = true;
-                    this.startAutoRefresh(); this.fetchMail();
+
+                _finalizeLogin(address) {
+                    this.address = address; this.isLoggedIn = true;
+                    this.fetchMail();
+                    this.autoRefreshInterval = setInterval(this.fetchMail, 10000);
                 },
-                async handleSendMail() {
-                    this.isLoading = true; this.error = ''; this.status = 'Encrypting...';
-                    try {
-                        const recipientRes = await fetch(`${SERVER_URL}/publicKey/${this.composeForm.recipient}`);
-                        if (!recipientRes.ok) throw new Error((await recipientRes.json()).error);
-                        const recipientPublicKey = forge.pki.publicKeyFromPem((await recipientRes.json()).publicKey);
-                        const encryptedContent = forge.util.encode64(recipientPublicKey.encrypt(this.composeForm.message, 'RSA-OAEP', { md: forge.md.sha256.create() }));
-                        this.status = 'Requesting challenge...';
-                        const challengeRes = await fetch(`${SERVER_URL}/send-challenge`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sender: this.address, recipient: this.composeForm.recipient, encryptedContent }) });
-                        if (!challengeRes.ok) throw new Error((await challengeRes.json()).error);
-                        const challengeData = await challengeRes.json();
-                        this.status = 'Solving challenge...';
-                        const decryptedNonce = this.privateKey.decrypt(forge.util.decode64(challengeData.encryptedNonce), 'RSA-OAEP', { md: forge.md.sha256.create() });
-                        this.status = 'Verifying...';
-                        const verifyRes = await fetch(`${SERVER_URL}/send-verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ challengeId: challengeData.challengeId, decryptedNonce }) });
-                        if (!verifyRes.ok) throw new Error((await verifyRes.json()).error);
-                        this.status = 'Mail Sent!'; this.composeForm.message = '';
-                        setTimeout(() => { this.composeModalInstance.hide(); this.status = ''; }, 1500);
-                    } catch (err) { this.status = `Send failed: ${err.message}`; } finally { this.isLoading = false; }
+
+                logout() {
+                    clearInterval(this.autoRefreshInterval);
+                    this.isLoggedIn = false; this.address = ''; this.privateKey = null; this.mailList = [];
                 },
+
+                // --- OPTIMIZED MAIL FETCHING ---
                 async fetchMail() {
                     try {
-                        const res = await fetch(`${SERVER_URL}/mailchain`); if (!res.ok) throw new Error('Failed to fetch mail.');
-                        const allMail = (await res.json()).chain;
-                        const myDomain = this.address.split('@')[1];
-                        this.mailList = allMail.filter(mail => {
-                            const recipientIsMe = mail.recipient === this.address;
-                            const recipientInMyDomain = mail.recipient.endsWith(`@${myDomain}`);
-                            return recipientIsMe || (this.isDomainClient && recipientInMyDomain);
-                        }).map(mail => {
+                        const url = this.isDomainClient 
+                            ? `${SERVER_URL}/mailchain` 
+                            : `${SERVER_URL}/mailchain?address=${encodeURIComponent(this.address)}`;
+                        
+                        const res = await fetch(url); 
+                        if (!res.ok) return;
+                        const data = await res.json();
+                        
+                        // Process and decrypt the returned messages
+                        this.mailList = data.chain.map((mail, index) => {
                             try {
-                                const decryptedContent = this.privateKey.decrypt(forge.util.decode64(mail.encryptedContent), 'RSA-OAEP', { md: forge.md.sha256.create() });
-                                return { from: mail.sender, to: mail.recipient, timestamp: mail.timestamp, content: decryptedContent };
-                            } catch (e) { return null; }
+                                const isSentByMe = mail.sender === this.address;
+                                let decryptedContent = "";
+
+                                // HYBRID DECRYPTION (AES-GCM)
+                                if (mail.encryptedMessage) {
+                                    const wrappedKey = isSentByMe ? mail.encryptedKeyForSender : mail.encryptedKeyForRecipient;
+                                    const aesKey = this.privateKey.decrypt(forge.util.decode64(wrappedKey), 'RSA-OAEP', { md: forge.md.sha256.create() });
+                                    
+                                    const decipher = forge.cipher.createDecipher('AES-GCM', aesKey);
+                                    decipher.start({
+                                        iv: forge.util.decode64(mail.iv),
+                                        tag: forge.util.createBuffer(forge.util.decode64(mail.tag))
+                                    });
+                                    decipher.update(forge.util.createBuffer(forge.util.decode64(mail.encryptedMessage)));
+                                    if (!decipher.finish()) throw new Error("Integrity check failed");
+                                    decryptedContent = forge.util.decodeUtf8(decipher.output.getBytes());
+                                } 
+                                // LEGACY RSA DECRYPTION
+                                else {
+                                    const payload = (isSentByMe && mail.encryptedForSender) ? mail.encryptedForSender : (mail.encryptedForRecipient || mail.encryptedContent);
+                                    const raw = this.privateKey.decrypt(forge.util.decode64(payload), 'RSA-OAEP', { md: forge.md.sha256.create() });
+                                    decryptedContent = forge.util.decodeUtf8(raw);
+                                }
+
+                                return { 
+                                    internalId: mail.id || `msg-${index}-${mail.timestamp}`, // FIX: Unique key for Vue selection
+                                    from: mail.sender, to: mail.recipient, 
+                                    timestamp: mail.timestamp, content: decryptedContent,
+                                    type: isSentByMe ? 'sent' : 'inbox' 
+                                };
+                            } catch (e) { return null; } 
                         }).filter(m => m !== null).reverse();
-                    } catch (err) { console.error(err); }
+                    } catch (err) { console.error("Mail Fetch Error:", err); }
                 },
-                downloadKeyFile() {
-                    if (!this.privateKey) {
-                        alert("No private key is currently loaded.");
-                        return;
-                    }
+
+                // --- SENDING ---
+                async handleSendMail() {
+                    if (!this.composeForm.message) return;
+                    this.isLoading = true; this.status = 'Encrypting...';
                     try {
-                        const keyPem = forge.pki.privateKeyToPem(this.privateKey);
-                        const keyFileData = {
-                            address: this.address,
-                            private_key_pem: keyPem
+                        const recipientRes = await fetch(`${SERVER_URL}/publicKey/${this.composeForm.recipient}`);
+                        if (!recipientRes.ok) throw new Error("Recipient not found on server.");
+                        const recipientPubKey = forge.pki.publicKeyFromPem((await recipientRes.json()).publicKey);
+                        const myPubKey = forge.pki.setRsaPublicKey(this.privateKey.n, this.privateKey.e);
+
+                        const aesKey = forge.random.getBytesSync(32);
+                        const iv = forge.random.getBytesSync(12);
+
+                        const cipher = forge.cipher.createCipher('AES-GCM', aesKey);
+                        cipher.start({ iv: iv });
+                        cipher.update(forge.util.createBuffer(forge.util.encodeUtf8(this.composeForm.message)));
+                        cipher.finish();
+
+                        const payload = {
+                            sender: this.address,
+                            recipient: this.composeForm.recipient,
+                            encryptedMessage: forge.util.encode64(cipher.output.getBytes()),
+                            iv: forge.util.encode64(iv),
+                            tag: forge.util.encode64(cipher.mode.tag.getBytes()),
+                            encryptedKeyForRecipient: forge.util.encode64(recipientPubKey.encrypt(aesKey, 'RSA-OAEP', { md: forge.md.sha256.create() })),
+                            encryptedKeyForSender: forge.util.encode64(myPubKey.encrypt(aesKey, 'RSA-OAEP', { md: forge.md.sha256.create() }))
                         };
-                        const jsonString = JSON.stringify(keyFileData, null, 4);
-                        const blob = new Blob([jsonString], { type: 'application/json' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        const sanitizedAddress = this.address.replace(/[^a-zA-Z0-9_@.-]/g, '_');
-                        a.download = `client_config_${sanitizedAddress}.json`;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        URL.revokeObjectURL(url);
-                    } catch (err) {
-                        alert(`Failed to prepare key file for download: ${err.message}`);
-                    }
+
+                        this.status = 'Solving Challenge...';
+                        const challengeRes = await fetch(`${SERVER_URL}/send-challenge`, { 
+                            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) 
+                        });
+                        const challengeData = await challengeRes.json();
+                        const decryptedNonce = this.privateKey.decrypt(forge.util.decode64(challengeData.encryptedNonce), 'RSA-OAEP', { md: forge.md.sha256.create() });
+                        
+                        await fetch(`${SERVER_URL}/send-verify`, { 
+                            method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+                            body: JSON.stringify({ challengeId: challengeData.challengeId, decryptedNonce }) 
+                        });
+
+                        this.status = 'Message Sent!';
+                        this.composeForm.message = '';
+                        setTimeout(() => { this.composeModalInstance.hide(); this.fetchMail(); }, 1000);
+                    } catch (err) { alert(err.message); } finally { this.isLoading = false; this.status = ''; }
                 },
-                logout() {
-                    this.isLoggedIn = false; this.address = ''; this.privateKey = null; this.mailList = []; this.selectedMail = null;
-                    this.error = ''; this.loginForm.address = 'alice@public.com';
-                    this.stopAutoRefresh();
-                },
+
+                triggerFileInput() { this.$refs.fileInput.click(); },
                 selectMail(mail) { this.selectedMail = mail; },
-                openComposeModal() { this.status = ''; this.composeModalInstance.show(); },
-                startAutoRefresh() { this.stopAutoRefresh(); this.autoRefreshInterval = setInterval(this.fetchMail, 5000); },
-                stopAutoRefresh() { if (this.autoRefreshInterval) clearInterval(this.autoRefreshInterval); },
-                _getStorageKey(address) { return `securemail_privkey_${address}`; },
-                _loadKeyFromStorage(address) { return localStorage.getItem(this._getStorageKey(address)); },
-                _saveKeyToStorage(address, keyPem) { localStorage.setItem(this._getStorageKey(address), keyPem); },
-                async _registerOnServer(address) {
-                    const res = await fetch(`${SERVER_URL}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
-                    if (!res.ok) throw new Error((await res.json()).error);
-                    return await res.json();
+                openComposeModal() { this.composeModalInstance.show(); },
+                downloadKeyFile() {
+                    const blob = new Blob([JSON.stringify({ address: this.address, private_key_pem: forge.pki.privateKeyToPem(this.privateKey) }, null, 2)], { type: 'application/json' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `key_${this.address}.json`;
+                    a.click();
                 }
             }
         });

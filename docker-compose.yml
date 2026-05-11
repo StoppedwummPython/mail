@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  server:
+    build: ./server
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./server/server_data.json:/app/server_data.json
+    environment:
+      - NODE_ENV=development
+
+  client:
+    build: ./client
+    environment:
+      - SERVER_URL=http://server:3000
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./client:/app
+    network_mode: host  # For X11 forwarding
+    stdin_open: true
+    tty: true
