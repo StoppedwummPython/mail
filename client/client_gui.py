@@ -7,7 +7,7 @@ from mail_client_logic import MailClientLogic
 
 # --- CONFIGURATION ---
 # Use environment variable if set, otherwise default to localhost
-SERVER_URL = os.environ.get('SERVER_URL', 'http://localhost:3000')
+SERVER_URL = os.environ.get('SERVER_URL', 'https://mail.stoppedwumm.net')
 REFRESH_INTERVAL_MS = 5000
 
 class App(tk.Tk):
